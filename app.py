@@ -8,7 +8,7 @@ import uuid
 from typing import Any
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, redirect, render_template, request , url_for
+from flask import Flask, jsonify, redirect, render_template, request
 from flask_cors import CORS
 from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
@@ -35,98 +35,6 @@ DEFAULT_DISCLAIMER = (
     "MedTranslate provides educational explanations of your medical documents "
     "and is not a substitute for professional medical advice or diagnosis."
 )
-
-
-def _build_mock_response(processed_doc: dict[str, Any], language: str) -> dict[str, Any]:
-    """Return a mock structured JSON response matching the shared team contract.
-
-    Used automatically when Member 3's `backend.ai_processor` module is not yet
-    implemented or raises ImportError / NotImplementedError.
-    """
-    filename = (processed_doc.get("filename") or "").lower()
-    extracted_text = (processed_doc.get("extracted_text") or "").lower()
-    combined_hint = f"{filename} {extracted_text}"
-
-    lab_keywords = ("hemoglobin", "lab", "reference range", "cbc", "blood", "g/dl", "test")
-    rx_keywords = ("rx", "prescription", "metformin", "tablet", "capsule", "dosage", "twice daily")
-
-    is_lab_hint = any(word in combined_hint for word in lab_keywords)
-    is_rx_hint = any(word in combined_hint for word in rx_keywords)
-
-    sample_medicine = {
-        "name": "Metformin",
-        "strength": "500 mg",
-        "dosage": "1 tablet",
-        "frequency": "twice daily",
-        "timing": "after meals",
-        "duration": "5 days",
-        "purpose": "Used to help control blood sugar levels.",
-        "important_information": ["Take with food to reduce stomach upset."],
-    }
-
-    sample_test = {
-        "name": "Hemoglobin",
-        "result": "11.2",
-        "unit": "g/dL",
-        "reference_range": "12.0 - 16.0 g/dL",
-        "status": "Below Reference Range",
-        "what_it_measures": "Measures the oxygen-carrying protein in red blood cells.",
-        "explanation": (
-            "Your value is slightly below the laboratory reference range. "
-            "Discuss this with your doctor."
-        ),
-    }
-
-    if is_lab_hint and not is_rx_hint:
-        document_type = "lab_report"
-        summary = (
-            f"[Mock {language} Output] This laboratory report includes a blood test measurement "
-            "showing hemoglobin slightly below the standard reference range. Please review "
-            "these findings with your healthcare provider."
-        )
-        medicines: list[dict[str, Any]] = []
-        tests = [sample_test]
-        questions = [
-            "What could be causing my hemoglobin level to be slightly below range?",
-            "Do I need any follow-up blood tests or dietary changes?",
-        ]
-    elif is_rx_hint and not is_lab_hint:
-        document_type = "prescription"
-        summary = (
-            f"[Mock {language} Output] This prescription outlines a medication schedule for "
-            "Metformin 500 mg to be taken with meals. Follow the prescribed timing and confirm "
-            "any ongoing refills with your clinician."
-        )
-        medicines = [sample_medicine]
-        tests = []
-        questions = [
-            "Should I continue taking Metformin after the 5-day course?",
-            "What side effects should I watch out for while taking this medication?",
-        ]
-    else:
-        document_type = "prescription"
-        summary = (
-            f"[Mock {language} Output] Sample structured medical translation showing how "
-            "prescribed medications and laboratory results are summarized in plain language. "
-            "Connect backend/ai_processor.py for live Gemini analysis."
-        )
-        medicines = [sample_medicine]
-        tests = [sample_test]
-        questions = [
-            "What could be causing my hemoglobin level to be slightly below range?",
-            "Should I take Metformin after meals for the full duration?",
-        ]
-
-    return {
-        "document_type": document_type,
-        "summary": summary,
-        "medicines": medicines,
-        "tests": tests,
-        "questions_for_doctor": questions,
-        "disclaimer": DEFAULT_DISCLAIMER,
-        # Marks placeholder output so the UI never presents it as a real analysis.
-        "demo": True,
-    }
 
 
 def _normalize_response_contract(payload: dict[str, Any]) -> dict[str, Any]:
@@ -260,8 +168,55 @@ def _enrich_prescription_medicines(
     return enriched
 
 
+def _enrich_lab_tests(tests: list[dict[str, Any]], language: str) -> list[dict[str, Any]]:
+    """Add source-grounded explanations without changing extracted lab facts."""
+    try:
+        from backend.explanation_generator import generate_lab_test_explanation
+        from backend.medical_retriever import retrieve_lab_test_info
+    except ImportError:
+        logger.info("Lab retrieval/explanation modules unavailable; keeping Stage 1 tests.")
+        return tests
+
+    enriched: list[dict[str, Any]] = []
+    for test in tests:
+        if not isinstance(test, dict):
+            continue
+
+        # Keep all Stage 1 fields exactly as extracted from the uploaded report.
+        authoritative_test = dict(test)
+        test_name = test.get("name") if isinstance(test.get("name"), str) else ""
+        try:
+            medical_info = retrieve_lab_test_info(test_name)
+        except Exception as exc:  # noqa: BLE001 - explanation must not break extraction
+            logger.warning("MedlinePlus lookup failed for lab test '%s': %s", test_name, exc)
+            medical_info = None
+
+        try:
+            explanation = generate_lab_test_explanation(
+                authoritative_test,
+                medical_info,
+                language=language,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Lab explanation failed for '%s': %s", test_name, exc)
+            explanation = {
+                "status": None,
+                "what_it_measures": None,
+                "explanation": (
+                    "An explanation is unavailable. The extracted result and reference range "
+                    "are shown as printed; this result alone cannot establish a diagnosis."
+                ),
+                "source": None,
+            }
+
+        authoritative_test.update(explanation)
+        enriched.append(authoritative_test)
+
+    return enriched
+
+
 def _invoke_ai_pipeline(processed_doc: dict[str, Any], language: str) -> dict[str, Any]:
-    """Run Gemini extraction, then enrich prescription medicines from DailyMed."""
+    """Run Gemini extraction, then add source-grounded prescription or lab context."""
     try:
         from backend.ai_processor import run_medtranslate_pipeline
     except ImportError:
@@ -288,6 +243,12 @@ def _invoke_ai_pipeline(processed_doc: dict[str, Any], language: str) -> dict[st
                 language=language,
             )
             normalized["stage"] = "extraction_and_medicine_explanation"
+        elif not normalized.get("error") and normalized["document_type"] == "lab_report" and normalized["tests"]:
+            normalized["tests"] = _enrich_lab_tests(
+                normalized["tests"],
+                language=language,
+            )
+            normalized["stage"] = "extraction_and_lab_explanation"
         return normalized
     except Exception as exc:  # noqa: BLE001
         logger.exception("AI analysis failed: %s", exc)
