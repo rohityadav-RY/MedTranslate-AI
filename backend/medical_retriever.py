@@ -1,16 +1,19 @@
-"""DailyMed REST API v2 retrieval module for MedTranslate.
+"""Trusted medical-information retrieval for MedTranslate.
 
-Retrieves structured, non-personalized FDA drug-label information from the
-official U.S. National Library of Medicine (NLM) DailyMed RESTful API v2:
+Retrieves non-personalized information from U.S. National Library of Medicine
+services:
 - Search endpoint: ``https://dailymed.nlm.nih.gov/dailymed/services/v2/spls.json``
 - Label XML endpoint: ``https://dailymed.nlm.nih.gov/dailymed/services/v2/spls/{setid}.xml``
+- LOINC search: ``https://clinicaltables.nlm.nih.gov/api/loinc_items/v3/search``
+- Lab-test information: ``https://connect.medlineplus.gov/service``
 
 This module does NOT use Gemini, embeddings, databases, caching, or patient context.
-It only fetches, parses, and cleans official FDA label sections for downstream stages.
+It fetches and cleans public reference information for downstream explanation stages.
 """
 
 from __future__ import annotations
 
+import html
 import logging
 import re
 import xml.etree.ElementTree as ET
@@ -24,6 +27,9 @@ DAILYMED_API_BASE: str = "https://dailymed.nlm.nih.gov/dailymed/services/v2"
 DAILYMED_DRUG_INFO_URL: str = "https://dailymed.nlm.nih.gov/dailymed/drugInfo.cfm"
 DEFAULT_TIMEOUT_SECONDS: float = 15.0
 DEFAULT_SEARCH_PAGE_SIZE: int = 10
+LOINC_SEARCH_URL: str = "https://clinicaltables.nlm.nih.gov/api/loinc_items/v3/search"
+MEDLINEPLUS_CONNECT_URL: str = "https://connect.medlineplus.gov/service"
+LOINC_SYSTEM_OID: str = "2.16.840.1.113883.6.1"
 
 # Standard HL7 SPL LOINC section codes
 _LOINC_INDICATIONS_AND_USAGE: tuple[str, ...] = ("34067-9", "55106-9")
@@ -518,6 +524,153 @@ def retrieve_medicine_info(
         "retrieval_status": "success",
         "purpose_information": purpose_info,
         "important_information": important_info,
+    }
+
+
+def _normalize_lab_name(value: str) -> str:
+    """Normalize a lab-test label for conservative LOINC name matching."""
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _empty_lab_result(test_name: str, status: str) -> dict[str, Any]:
+    return {
+        "test": test_name,
+        "source": "MedlinePlus.gov",
+        "source_url": None,
+        "loinc_code": None,
+        "loinc_display": None,
+        "medical_information": None,
+        "retrieval_status": status,
+    }
+
+
+def retrieve_lab_test_info(
+    test_name: str,
+    *,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    session: requests.Session | None = None,
+) -> dict[str, Any]:
+    """Retrieve a lab-test explanation source from NLM/NIH MedlinePlus.
+
+    A lab name is first matched conservatively to a LOINC question using the
+    NLM Clinical Table Search Service. MedlinePlus Connect is queried only when
+    one unambiguous LOINC match is available. Ambiguous names deliberately fail
+    closed instead of selecting a potentially different specimen or method.
+    """
+    if not isinstance(test_name, str) or not test_name.strip():
+        return _empty_lab_result("", "invalid_input")
+
+    cleaned_name = _clean_text(test_name)
+    normalized_name = _normalize_lab_name(cleaned_name)
+    http = session or requests
+
+    try:
+        lookup = http.get(
+            LOINC_SEARCH_URL,
+            params={
+                "type": "question",
+                "terms": cleaned_name,
+                "df": "text,LOINC_NUM",
+                "count": 10,
+            },
+            timeout=timeout,
+        )
+        lookup.raise_for_status()
+        payload = lookup.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("LOINC lookup failed for '%s': %s", cleaned_name, exc)
+        return _empty_lab_result(cleaned_name, "lookup_error")
+
+    if not isinstance(payload, list) or len(payload) < 4:
+        return _empty_lab_result(cleaned_name, "malformed_response")
+
+    codes = payload[1] if isinstance(payload[1], list) else []
+    displays = payload[3] if isinstance(payload[3], list) else []
+    candidates: dict[str, str] = {}
+    for index, code in enumerate(codes):
+        if not isinstance(code, str) or not code.strip() or index >= len(displays):
+            continue
+        display_row = displays[index]
+        display = display_row[0] if isinstance(display_row, list) and display_row else None
+        if not isinstance(display, str) or not display.strip():
+            continue
+        normalized_display = _normalize_lab_name(display)
+        if (
+            normalized_display == normalized_name
+            or normalized_display.startswith(normalized_name)
+            or normalized_name.startswith(normalized_display)
+        ):
+            candidates[code.strip()] = display.strip()
+
+    if not candidates:
+        return _empty_lab_result(cleaned_name, "not_found")
+    if len(candidates) != 1:
+        logger.info("Ambiguous LOINC match for lab test '%s'; skipping source lookup.", cleaned_name)
+        return _empty_lab_result(cleaned_name, "ambiguous_match")
+
+    loinc_code, loinc_display = next(iter(candidates.items()))
+    try:
+        response = http.get(
+            MEDLINEPLUS_CONNECT_URL,
+            params={
+                "mainSearchCriteria.v.cs": LOINC_SYSTEM_OID,
+                "mainSearchCriteria.v.c": loinc_code,
+                "mainSearchCriteria.v.dn": loinc_display,
+                "informationRecipient.languageCode.c": "en",
+            },
+            headers={"Accept": "application/atom+xml, application/xml"},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+    except (requests.RequestException, ET.ParseError) as exc:
+        logger.warning("MedlinePlus lab lookup failed for '%s' (%s): %s", cleaned_name, loinc_code, exc)
+        return {
+            **_empty_lab_result(cleaned_name, "source_error"),
+            "loinc_code": loinc_code,
+            "loinc_display": loinc_display,
+        }
+
+    entries = [node for node in root.iter() if _local_tag(node.tag) == "entry"]
+    if not entries:
+        return {
+            **_empty_lab_result(cleaned_name, "no_source_match"),
+            "loinc_code": loinc_code,
+            "loinc_display": loinc_display,
+        }
+
+    entry = entries[0]
+    title = None
+    summary = None
+    source_url = None
+    for node in entry.iter():
+        tag = _local_tag(node.tag)
+        if tag == "title" and not title:
+            title = _clean_text("".join(node.itertext()))
+        elif tag == "summary" and not summary:
+            raw_summary = html.unescape("".join(node.itertext()))
+            summary = _clean_text(re.sub(r"<[^>]+>", " ", raw_summary))
+        elif tag == "link" and not source_url:
+            href = node.attrib.get("href")
+            if href and href.startswith("https://medlineplus.gov/"):
+                source_url = href
+
+    if not summary:
+        return {
+            **_empty_lab_result(cleaned_name, "empty_source"),
+            "loinc_code": loinc_code,
+            "loinc_display": loinc_display,
+            "source_url": source_url,
+        }
+
+    return {
+        "test": cleaned_name,
+        "source": "MedlinePlus.gov",
+        "source_url": source_url,
+        "loinc_code": loinc_code,
+        "loinc_display": title or loinc_display,
+        "medical_information": summary[:5000],
+        "retrieval_status": "success",
     }
 
 
