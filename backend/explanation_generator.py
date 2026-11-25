@@ -1,12 +1,9 @@
-"""Stage 2 patient-friendly medicine explanation generator for MedTranslate.
+"""Stage 2 patient-friendly medical explanation generator for MedTranslate.
 
-Takes:
-1. Authoritative prescription facts extracted by Stage 1 (``backend/ai_processor.py``).
-2. Trusted medical label information retrieved by ``backend/medical_retriever.py``.
-
-Uses Gemini (``google-genai``) to translate the retrieved DailyMed information
-into plain, patient-friendly language while preserving prescription facts verbatim
-and enforcing strict non-diagnostic safety boundaries.
+For prescriptions, it uses authoritative prescription facts and DailyMed label
+information. For lab reports, it uses extracted test facts and MedlinePlus data.
+Gemini rewrites retrieved information in plain language while preserving
+extracted facts and enforcing strict non-diagnostic safety boundaries.
 """
 
 from __future__ import annotations
@@ -56,6 +53,10 @@ Strict rules:
 14. Write patient-friendly explanations in the requested target language without sacrificing medical accuracy.
 15. Return valid JSON matching the requested schema.
 16. When simplifying medical source text, preserve the scope of the original statement. If the source gives a restriction that depends on a specific condition, measurement, threshold, or clinical circumstance, retain that dependency explicitly in the explanation rather than replacing it with a broader statement.
+17. Write for a reader with no medical training: use everyday words, short sentences, and a calm, respectful tone.
+18. If a medical term cannot be avoided, explain it briefly in ordinary words the first time it appears.
+19. Rewrite source information in your own words. Do not copy sentences or long phrases from DailyMed; preserve their meaning and all safety qualifications.
+20. Keep each explanation concise: usually one or two short sentences per item. Do not omit a warning or qualification just to make it shorter.
 """
 
 class ExplanationGeneratorError(RuntimeError):
@@ -154,6 +155,20 @@ class MedicineExplanationResponse(BaseModel):
     error: str | None = None
 
 
+class LabExplanationPayload(BaseModel):
+    """Validated, source-grounded explanation fields returned by Gemini."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    what_it_measures: str | None = None
+    possible_meaning: str | None = None
+
+    @field_validator("what_it_measures", "possible_meaning", mode="before")
+    @classmethod
+    def _clean_lab_explanation(cls, value: Any) -> str | None:
+        return _clean_optional_str(value)
+
+
 def _extract_prescribed_usage(medicine: dict[str, Any]) -> tuple[str | None, PrescribedUsage]:
     """Validate and normalize authoritative prescription facts from ``medicine``."""
     if not isinstance(medicine, dict):
@@ -226,16 +241,20 @@ def build_explanation_prompt(
         f"Purpose / Indications:\n{purpose_text}\n\n"
         f"Warnings / Precautions / Adverse Reactions:\n{important_block}\n\n"
         "TASK\n"
-        f"Write a clear, patient-friendly explanation in {language} using ONLY the TRUSTED MEDICAL INFORMATION above:\n"
-        "1. `purpose`: Summarize the general purpose of this medicine in simple language (or null if unavailable).\n"
-        "2. `important_information`: List key safety warnings or precautions from the retrieved text in plain language (or [] if unavailable).\n"
-        "3. `common_information`: List other helpful general label facts (such as common side effects mentioned in the retrieved text) in plain language (or [] if unavailable).\n\n"
+        f"Write a clear, patient-friendly explanation in {language} using ONLY the TRUSTED MEDICAL INFORMATION above.\n"
+        "1. `purpose`: Explain what the medicine is generally used for in everyday words, in no more than two short sentences (or null if unavailable).\n"
+        "2. `important_information`: Rewrite the important warnings and precautions in everyday language. Briefly explain unavoidable medical terms. Keep each item concise, but preserve every important warning, condition, exception, threshold, and qualification (or [] if unavailable).\n"
+        "3. `common_information`: Briefly explain other useful label facts, including common side effects only when they appear in the supplied source (or [] if unavailable).\n"
+        "Do not copy source sentences. Explain them in your own words without changing their meaning or severity.\n\n"
         "SAFETY RULES\n"
         "- Prescription facts describe what the user's document says; DailyMed provides general medical information.\n"
         "- NEVER change, infer, or invent prescription facts.\n"
         "- NEVER invent medical facts absent from TRUSTED MEDICAL INFORMATION.\n"
         "- Do NOT diagnose, recommend starting/stopping/changing medication, or give personalized treatment advice.\n"
         "- Do NOT tell the patient to ignore their prescription.\n\n"
+        "- Prefer familiar everyday words and short sentences; explain any unavoidable medical term in a few words.\n"
+        "- Keep explanations short, but never remove an important safety warning or its conditions.\n"
+        "- Do not add facts from memory or general knowledge that are absent from the supplied source.\n\n"
         "OUTPUT FORMAT\n"
         "Return a JSON object with keys: `purpose` (string or null), "
         "`important_information` (array of strings), and `common_information` (array of strings)."
@@ -378,6 +397,7 @@ def generate_medicine_explanation(
             error=str(exc),
         ).model_dump()
 
+
     if not med_name:
         return MedicineExplanationResponse(
             medicine=None,
@@ -488,6 +508,201 @@ def generate_medicine_explanation(
             disclaimer=DEFAULT_EXPLANATION_DISCLAIMER,
             error="An unexpected error occurred while generating the medicine explanation.",
         ).model_dump()
+
+
+def _classify_lab_result(result: Any, reference_range: Any, unit: Any = None) -> str | None:
+    """Compare simple numeric results with a two-number printed reference range.
+
+    Non-numeric, inequality-based, qualitative, or ambiguous ranges are left
+    unclassified rather than guessed. The original extracted strings are never
+    changed by this helper.
+    """
+    result_text = _clean_optional_str(result)
+    range_text = _clean_optional_str(reference_range)
+    if not result_text or not range_text:
+        return None
+
+    result_match = re.fullmatch(
+        r"\s*(-?\d+(?:\.\d+)?)\s*([a-zA-Z/%µμ]+(?:\s*/\s*[a-zA-Z]+)?)?\s*",
+        result_text,
+    )
+    range_match = re.fullmatch(
+        r"\s*(-?\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*"
+        r"(-?\d+(?:\.\d+)?)\s*([a-zA-Z/%µμ]+(?:\s*/\s*[a-zA-Z]+)?)?\s*",
+        range_text,
+        flags=re.IGNORECASE,
+    )
+    if not result_match or not range_match:
+        return None
+
+    def normalize_unit(value: Any) -> str | None:
+        cleaned = _clean_optional_str(value)
+        return re.sub(r"\s+", "", cleaned).lower() if cleaned else None
+
+    result_unit = normalize_unit(result_match.group(2))
+    report_unit = normalize_unit(unit)
+    range_unit = normalize_unit(range_match.group(3))
+    if result_unit and report_unit and result_unit != report_unit:
+        return None
+    effective_result_unit = report_unit or result_unit
+    if effective_result_unit and range_unit and effective_result_unit != range_unit:
+        return None
+
+    value = float(result_match.group(1))
+    lower = float(range_match.group(1))
+    upper = float(range_match.group(2))
+    if lower > upper:
+        return None
+    if value < lower:
+        return "Below reference range"
+    if value > upper:
+        return "Above reference range"
+    return "Within reference range"
+
+
+def _parse_lab_explanation_response(response: Any) -> LabExplanationPayload:
+    """Parse Gemini's structured lab explanation response."""
+    parsed = getattr(response, "parsed", None)
+    if isinstance(parsed, LabExplanationPayload):
+        return parsed
+    if isinstance(parsed, BaseModel):
+        return LabExplanationPayload.model_validate(parsed.model_dump())
+    if isinstance(parsed, dict):
+        return LabExplanationPayload.model_validate(parsed)
+
+    raw_text = getattr(response, "text", None)
+    if not isinstance(raw_text, str) or not raw_text.strip():
+        raise ExplanationAPIError("Gemini returned an empty lab explanation.")
+    cleaned = raw_text.strip()
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", cleaned, flags=re.DOTALL)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    try:
+        return LabExplanationPayload.model_validate(json.loads(cleaned))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise ExplanationAPIError(f"Gemini returned invalid lab explanation JSON: {exc}") from exc
+
+
+def generate_lab_test_explanation(
+    test: dict[str, Any],
+    medical_information: dict[str, Any] | None,
+    language: str = DEFAULT_LANGUAGE,
+    *,
+    client: Any | None = None,
+    types_module: Any | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    """Explain a lab test without changing its extracted name, value, or range.
+
+    Interpretation is limited to a deterministic comparison against the
+    reference range printed on the report. General test information and
+    possible meanings are generated only from retrieved MedlinePlus content.
+    """
+    if not isinstance(test, dict):
+        raise ExplanationInputError("test must be a dictionary.")
+
+    original_result = test.get("result")
+    original_range = test.get("reference_range")
+    status = _classify_lab_result(original_result, original_range, test.get("unit"))
+    source_url = None
+    source_text = None
+    source_name = None
+    loinc_display = None
+    if isinstance(medical_information, dict):
+        if str(medical_information.get("retrieval_status") or "").lower() == "success":
+            source_text = _clean_optional_str(medical_information.get("medical_information"))
+            source_url = _clean_optional_str(medical_information.get("source_url"))
+            source_name = _clean_optional_str(medical_information.get("source"))
+            loinc_display = _clean_optional_str(medical_information.get("loinc_display"))
+
+    generated = LabExplanationPayload()
+    if source_text:
+        try:
+            if client is None or types_module is None:
+                resolved_client, resolved_types = _get_gemini_client()
+                client = client or resolved_client
+                types_module = types_module or resolved_types
+
+            prompt = (
+                "You are explaining one laboratory test to a person with no medical training.\n"
+                f"Target language: {language}.\n"
+                f"Test name from the report: {test.get('name') or 'Not specified'}\n"
+                f"Standard test label: {loinc_display or 'Not available'}\n"
+                f"Trusted MedlinePlus information: {source_text}\n\n"
+                "Return two concise fields. `what_it_measures` must explain in everyday words "
+                "what this test measures, defining unavoidable medical terms briefly. "
+                "`possible_meaning` may mention general reasons or associations only when "
+                "they are explicitly supported by the supplied MedlinePlus text. Phrase these "
+                "as possibilities, never as the patient's cause. If the source does not "
+                "support an explanation, return null for that field.\n"
+                "Do not diagnose, infer patient history, recommend treatment, or invent causes. "
+                "Do not repeat or alter the patient's result or reference range. Use simple "
+                "language, one or two short sentences per field, and do not copy source wording."
+            )
+            schema = types_module.Schema(
+                type=types_module.Type.OBJECT,
+                properties={
+                    "what_it_measures": types_module.Schema(
+                        type=types_module.Type.STRING,
+                        description="Plain-language description of what the test measures, or null.",
+                        nullable=True,
+                    ),
+                    "possible_meaning": types_module.Schema(
+                        type=types_module.Type.STRING,
+                        description="Source-supported general associations only, or null.",
+                        nullable=True,
+                    ),
+                },
+                required=["what_it_measures", "possible_meaning"],
+            )
+            target_model = (model or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+            config = types_module.GenerateContentConfig(
+                system_instruction=(
+                    "Use only the supplied MedlinePlus information. Explain it simply and briefly. "
+                    "Never diagnose or claim that a possible association is the cause for this patient."
+                ),
+                temperature=0.1,
+                response_mime_type="application/json",
+                response_schema=schema,
+            )
+            response = client.models.generate_content(
+                model=target_model,
+                contents=prompt,
+                config=config,
+            )
+            generated = _parse_lab_explanation_response(response)
+        except Exception as exc:  # noqa: BLE001 - preserve extracted result if explanation fails
+            logger.warning("Lab explanation generation failed for '%s': %s", test.get("name"), exc)
+
+    if status == "Within reference range":
+        explanation = (
+            "This result is within the reference range printed on the report. "
+            "A reference range is a guide and does not, by itself, confirm that everything is healthy."
+        )
+    elif status in {"Below reference range", "Above reference range"}:
+        direction = "below" if status.startswith("Below") else "above"
+        explanation = f"This result is {direction} the reference range printed on the report."
+        if generated.possible_meaning:
+            explanation += f" The MedlinePlus information notes that this can sometimes be associated with: {generated.possible_meaning}"
+        else:
+            explanation += " The available reference information does not establish why it is outside the range."
+        explanation += " This result alone cannot identify a cause or establish a diagnosis."
+    else:
+        explanation = (
+            "The result could not be compared reliably with the printed reference range. "
+            "This result alone cannot establish a diagnosis."
+        )
+
+    return {
+        "status": status,
+        "what_it_measures": generated.what_it_measures,
+        "explanation": explanation,
+        "source": (
+            {"name": source_name or "MedlinePlus.gov", "url": source_url}
+            if source_text
+            else None
+        ),
+    }
 
 
 def run_structural_tests() -> bool:
